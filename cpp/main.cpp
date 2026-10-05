@@ -267,15 +267,27 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
     rh &= ~1;                                   // 偶数宽高对编码器/滤镜更友好
     bool whole = (rx == 0 && ry == 0 && rw == vi.w && rh == vi.h);
 
-    // ---------- 3. 读取每帧真实时间, 决定抽哪些帧 ----------
-    std::vector<double> pts = probe_frame_times(ffprobe, o.video);
-    bool pts_valid = !pts.empty();
-    if (!pts_valid && vi.fps > 0 && vi.reported_frames > 0) {
-        // 极端情况(容器读不出 PTS)下退化为按平均帧率估算
+    // ---------- 3. 取得时间基准, 决定抽哪些帧 ----------
+    // 恒定帧率(CFR)视频每帧间隔相同, 时间点可以直接由「帧号 ÷ 帧率」算出,
+    // 于是**不必扫全片 PTS**; 变帧率(VFR)视频间隔不均匀, 必须取逐帧真实时间戳。
+    // 三条路径都会打印出来, 便于确认这次到底有没有完整扫描一遍 PTS。
+    enum class TimeBase { CfrDerived, PtsScanned, PtsEstimated };
+    TimeBase tbase = TimeBase::PtsScanned;
+    std::vector<double> pts;
+    if (vi.cfr && vi.fps > 0 && vi.reported_frames > 0) {
+        tbase = TimeBase::CfrDerived;
+        pts.reserve((size_t)vi.reported_frames);
         for (long long i = 0; i < vi.reported_frames; ++i)
             pts.push_back((double)i / vi.fps);
-        std::fprintf(stderr, "提示: 未能读到逐帧 PTS, 时间点按平均帧率 %g 估算。\n", vi.fps);
+    } else {
+        pts = probe_frame_times(ffprobe, o.video);
+        if (pts.empty() && vi.fps > 0 && vi.reported_frames > 0) {
+            tbase = TimeBase::PtsEstimated;      // 容器读不出逐帧 PTS 时的兜底
+            for (long long i = 0; i < vi.reported_frames; ++i)
+                pts.push_back((double)i / vi.fps);
+        }
     }
+    bool pts_valid = !pts.empty();
     std::vector<char> keep(pts.size(), 0);      // keep[i] = 第 i 帧是否要识别
     bool by_seconds = o.every_seconds > 0.0;
     long long step = o.every_frames;
@@ -324,6 +336,19 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
     if (vi.reported_frames > 0) std::printf("  %lld 帧", vi.reported_frames);
     if (pts_valid) std::printf("  最后一帧 PTS %.3fs", pts.back());
     std::printf("\n");
+    // 时间基准: 明确告知本次是否完整扫描了全片 PTS
+    switch (tbase) {
+    case TimeBase::CfrDerived:
+        std::printf("时间基准  : 恒定帧率 %.3f fps -> 跳过 PTS 扫描, 时间点由帧号推算\n", vi.fps);
+        break;
+    case TimeBase::PtsScanned:
+        std::printf("时间基准  : 变帧率 (标称 %.3f fps / 平均 %.3f fps)"
+                    " -> 已完整扫描全片 PTS, %zu 帧\n", vi.r_fps, vi.avg_fps, pts.size());
+        break;
+    case TimeBase::PtsEstimated:
+        std::printf("时间基准  : 读不到逐帧 PTS -> 时间点按平均帧率 %.3f fps 估算\n", vi.fps);
+        break;
+    }
     if (o.has_roi) {
         std::printf("感兴趣区域: (%d,%d) %dx%d  [%s]\n", rx, ry, rw, rh,
                     o.roi_relative ? "相对比例" : "像素");
@@ -331,8 +356,9 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
         std::printf("感兴趣区域: 整帧\n");
     }
     if (by_seconds)
-        std::printf("抽帧间隔  : 每 %.3f 秒 1 帧 (按真实时间戳选取, 共 %lld 帧)\n",
-                    o.every_seconds, planned);
+        std::printf("抽帧间隔  : 每 %.3f 秒 1 帧 (%s, 共 %lld 帧)\n", o.every_seconds,
+                    tbase == TimeBase::CfrDerived ? "按帧号推算时间选取" : "按真实时间戳选取",
+                    planned);
     else if (step > 1)
         std::printf("抽帧间隔  : 每 %lld 帧取 1 帧 (共 %lld 帧)\n", step, planned);
     else

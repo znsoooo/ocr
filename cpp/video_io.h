@@ -166,9 +166,12 @@ inline std::string detect_passthrough_opt(const std::string &ffmpeg) {
 
 struct VideoInfo {
     int w = 0, h = 0;
-    double fps = 0.0;
+    double fps = 0.0;           // 实际使用的帧率 (优先取平均帧率)
+    double r_fps = 0.0;         // 容器标称帧率 r_frame_rate
+    double avg_fps = 0.0;       // 平均帧率 avg_frame_rate
     double duration = 0.0;
     long long reported_frames = -1;
+    bool cfr = false;           // 是否可判定为恒定帧率(判定见 classify_frame_rate)
 };
 
 // 解析 "30000/1001" 这类帧率写法
@@ -178,6 +181,24 @@ inline double parse_rate(const std::string &s) {
     double num = std::atof(s.substr(0, slash).c_str());
     double den = std::atof(s.substr(slash + 1).c_str());
     return den != 0.0 ? num / den : 0.0;
+}
+
+// 判断能否用「帧号 ÷ 帧率」代替真实时间戳。
+// 恒定帧率(CFR)视频每帧间隔相同, 时间点可以直接由帧号算出, 于是**不必扫全片 PTS**;
+// 变帧率(VFR)视频间隔不均匀, 必须扫。判定要求两个信号都成立才敢走捷径:
+//   信号一: 标称帧率 r_frame_rate 与平均帧率 avg_frame_rate 一致(相对差 < 0.5%)
+//   信号二: (若时长与总帧数都拿得到) 总帧数 ÷ 时长 也要对得上平均帧率(相对差 < 1%)
+// 任一信号可疑就判定为 VFR —— 宁可多扫一遍, 也不让时间点不准。
+inline void classify_frame_rate(VideoInfo &vi) {
+    vi.cfr = false;
+    if (vi.r_fps <= 0.0 || vi.avg_fps <= 0.0) return;
+    double diff = std::fabs(vi.r_fps - vi.avg_fps) / std::max(vi.r_fps, vi.avg_fps);
+    if (diff > 0.005) return;
+    if (vi.duration > 0.0 && vi.reported_frames > 0) {
+        double implied = (double)vi.reported_frames / vi.duration;
+        if (std::fabs(implied - vi.avg_fps) / vi.avg_fps > 0.01) return;
+    }
+    vi.cfr = true;
 }
 
 inline bool probe_video(const std::string &ffprobe, const std::string &path, VideoInfo &vi) {
@@ -208,8 +229,10 @@ inline bool probe_video(const std::string &ffprobe, const std::string &path, Vid
         else if (k == "duration")       vi.duration = std::atof(v.c_str());
         else if (k == "nb_frames")      vi.reported_frames = std::atoll(v.c_str());
     }
-    vi.fps = parse_rate(a_rate);
-    if (vi.fps <= 0.0) vi.fps = parse_rate(r_rate);
+    vi.r_fps   = parse_rate(r_rate);
+    vi.avg_fps = parse_rate(a_rate);
+    vi.fps = vi.avg_fps > 0.0 ? vi.avg_fps : vi.r_fps;
+    classify_frame_rate(vi);
     return vi.w > 0 && vi.h > 0;
 }
 

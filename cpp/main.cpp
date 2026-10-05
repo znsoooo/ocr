@@ -25,6 +25,7 @@
 //
 //  输出:
 //    --min-score X         过滤掉置信度低于 X 的行 (默认 0, 不过滤)
+//    --no-dedup            [视频] 关闭跨帧去重, 每帧全量输出
 //    --json PATH           结果写入 JSON (逐行文字 + 置信度 + 四点坐标)
 //    --visual PATH         图片模式: 输出画了识别框的 PNG 文件
 //                          视频模式: 输出目录, 逐帧存画了识别框的 PNG
@@ -33,6 +34,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "ocr_engine.h"
 #include "video_io.h"
+#include "dedup.h"
 
 #include <vector>
 
@@ -64,7 +66,10 @@ struct Options {
     int threads = 4;
 
     float min_score = 0.f;                     // 输出
-    std::string json_path, visual_path;
+    int min_chars = 2;                         // 输出: 丢掉去标点后不足这么多字的行
+    std::string json_path, visual_path, save_jpg_path;
+    bool dedup = false;                        // [视频] 跨帧去重(默认关, 加 --dedup 打开)
+    bool only_text = false;                    // 输出: 只打印文本, 不带序号/坐标/置信度
 };
 
 static void print_usage(const char *prog) {
@@ -91,9 +96,22 @@ static void print_usage(const char *prog) {
         "\n"
         "输出:\n"
         "  --min-score X         过滤掉置信度低于 X 的行 (默认 0, 不过滤)\n"
+        "  --min-chars N         丢掉\"去掉标点后不足 N 个字\"的行 (默认 2):\n"
+        "                        可滤掉句首被切碎的短词、图标误识别; 设 1 表示不过滤\n"
+        "  --only-text           只输出文本内容, 不打印序号/置信度/四点坐标:\n"
+        "                        图片模式 -> 逐行打印文字\n"
+        "                        视频模式 -> 帧号 + 时间 + 文字\n"
+        "  --dedup               [视频] 开启跨帧去重(默认关闭):\n"
+        "                        同一段文字只输出一次, 且不输出字幕\"还没打印完\"的中间版本\n"
         "  --json PATH           结果写入 JSON (逐行文字 + 置信度 + 四点坐标)\n"
         "  --visual PATH         图片模式: 输出画了识别框的 PNG 文件\n"
         "                        视频模式: 输出目录, 逐帧存画了识别框的 PNG\n"
+        "                        (可视化不受去重影响, 每个采样帧都会存)\n"
+        "  --save-jpg PATH       [视频] 给\"去重后仍然有字幕\"的画面存 JPG (需配合 --dedup):\n"
+        "                        从原视频截取整帧(不是 ROI), 不画框;\n"
+        "                        文件名为 分-秒-毫秒.jpg, 如 00-09-500.jpg\n"
+        "\n"
+        "  上面所有指定 PATH 的目录参数, 目录不存在时会自动创建。\n"
         "\n"
         "示例:\n"
         "  %s --image shot.png\n"
@@ -150,6 +168,49 @@ static Image sub_image(const Image &src, int x, int y, int w, int h) {
     return out;
 }
 
+// 去掉标点空白后还够长吗? 用来滤掉句首被切碎的短词、图标误识别之类。
+// 实测一段 3 分 55 秒的游戏录屏: 1 个字的行只有 8 行, 全是噪声;
+// 2 个字的行有 250 行, 其中 231 行是说话人名字「派蒙」—— 所以门槛放在 2 字。
+static bool text_too_short(const std::string &text, int min_chars) {
+    if (min_chars <= 1) return false;
+    return (int)dedup::utf8_chars(dedup::normalize(text)).size() < min_chars;
+}
+
+// 取路径的父目录 (没有分隔符时返回空串)
+static std::string parent_dir(const std::string &p) {
+    const size_t pos = p.find_last_of("/\\");
+    if (pos == std::string::npos) return std::string();
+    if (pos == 0) return std::string("/");
+    return p.substr(0, pos);
+}
+
+// 递归创建目录 (等价 mkdir -p)。已存在的层级会返回非 0, 忽略即可。
+static void make_dirs(const std::string &path) {
+    if (path.empty()) return;
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if ((path[i] == '/' || path[i] == '\\') && cur.size() > 1) MKDIR_ONE(cur.c_str());
+    }
+    MKDIR_ONE(path.c_str());
+}
+
+// 写文件前确保它的父目录存在
+static void ensure_parent(const std::string &path) {
+    const std::string d = parent_dir(path);
+    if (!d.empty()) make_dirs(d);
+}
+
+// 把秒数格式化成 "分-秒-毫秒", 如 9.5s -> "00-09-500"
+static std::string jpg_name_of(double seconds) {
+    long long ms = (long long)std::llround(seconds * 1000.0);
+    if (ms < 0) ms = 0;
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%02lld-%02lld-%03lld.jpg",
+                  ms / 60000, (ms / 1000) % 60, ms % 1000);
+    return std::string(buf);
+}
+
 // ----------------------------- 图片模式 -----------------------------
 
 static int run_image(const Options &o, const std::string &model_dir) {
@@ -173,6 +234,7 @@ static int run_image(const Options &o, const std::string &model_dir) {
     kept.reserve(items.size());
     for (auto &it : items) {
         if (it.score < o.min_score) continue;
+        if (text_too_short(it.text, o.min_chars)) continue;
         if (!whole) {
             for (int k = 0; k < 4; ++k) {
                 it.quad.p[k].x += (float)rx;
@@ -187,6 +249,10 @@ static int run_image(const Options &o, const std::string &model_dir) {
     std::printf("  检测到 %d 行文字  耗时 %.0f ms (%s)\n",
                 (int)kept.size(), ms, o.v5 ? "PP-OCRv5" : "PP-OCRv4");
     for (size_t i = 0; i < kept.size(); ++i) {
+        if (o.only_text) {                      // 只打印文字本身
+            std::printf("%s\n", kept[i].text.c_str());
+            continue;
+        }
         const auto &q = kept[i].quad;
         std::printf("[%02d] x=%4d y=%4d w=%4d h=%3d  score=%.2f  %s\n", (int)i + 1,
                     (int)q.xmin(), (int)q.ymin(), (int)(q.xmax() - q.xmin()),
@@ -203,6 +269,7 @@ static int run_image(const Options &o, const std::string &model_dir) {
             draw_number(vis, (int)i + 1, (int)q.xmin(), std::max((int)q.ymin() - 16, 0),
                         255, 96, 0);
         }
+        ensure_parent(o.visual_path);
         if (save_image(o.visual_path, vis))
             std::printf("可视化    : %s\n", o.visual_path.c_str());
         else
@@ -210,6 +277,7 @@ static int run_image(const Options &o, const std::string &model_dir) {
     }
 
     if (!o.json_path.empty()) {
+        ensure_parent(o.json_path);
         std::ofstream f(o.json_path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "警告: 无法写入 JSON: %s\n", o.json_path.c_str());
@@ -307,6 +375,12 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
     // ---------- 4. 初始化引擎 ----------
     OcrEngine engine(model_dir, o.v5, o.threads, o.unclip);
 
+    // 跨帧去重: 时间阈值按实际采样间隔换算, 这样逐帧和抽帧用同一套判定
+    double sample_interval = by_seconds ? o.every_seconds
+                           : (vi.fps > 0 ? (double)step / vi.fps : 0.5);
+    if (sample_interval <= 0.0) sample_interval = 0.5;
+    dedup::LineDedup dedup_engine(sample_interval);
+
     // ---------- 5. 组装 ffmpeg 命令 ----------
     // 只让 ffmpeg 做 crop(在源头上把 ROI 裁掉, 管道里只传 ROI 像素)。
     // 抽帧不交给 ffmpeg 的 select 滤镜, 而是把每一帧都读进来、在本地按真实 PTS
@@ -366,6 +440,10 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
     std::printf("模型      : %s\n", o.v5 ? "PP-OCRv5" : "PP-OCRv4");
     if (!whole)
         std::printf("坐标说明  : 输出的四点坐标已加回 ROI 偏移, 即相对原帧左上角\n");
+    if (o.dedup)
+        std::printf("跨帧去重  : 开启 (同一段文字只输出一次, 跳过未打印完整的中间版本)\n");
+    else
+        std::printf("跨帧去重  : 关闭 (默认; 想合并重复字幕请加 --dedup)\n");
     std::printf("---------------------------------------------------------------\n");
     std::fflush(stdout);
 
@@ -382,6 +460,7 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
 
     FILE *json = nullptr;
     if (!o.json_path.empty()) {
+        ensure_parent(o.json_path);
         json = std::fopen(o.json_path.c_str(), "wb");
         if (json) {
             std::fprintf(json, "{\n  \"video\": \"%s\",\n", json_escape(o.video).c_str());
@@ -406,6 +485,67 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
     long long frame_no = 0, sampled = 0, frames_with_text = 0, total_lines = 0;
     auto t0 = std::chrono::steady_clock::now();
     bool first_json = true;
+    std::vector<std::pair<long long, double>> shots;   // --save-jpg: 待截图的 (帧号, 时间)
+
+    // 输出一组行(控制台 + JSON)。去重后由 LineDedup 决定"哪些行、归到哪一帧"输出。
+    auto emit_group = [&](const dedup::Group &g) {
+        ++frames_with_text;
+        total_lines += (long long)g.items.size();
+
+        std::printf("[帧 %06lld] t=%s  %zu 行\n", g.frame, fmt_time(g.time).c_str(),
+                    g.items.size());
+        for (size_t j = 0; j < g.items.size(); ++j) {
+            const dedup::Item &it = g.items[j];
+            if (o.only_text) {                  // 只打印文字本身
+                std::printf("    %s\n", it.text.c_str());
+                continue;
+            }
+            std::printf("    #%zu  %.3f  (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f)  %s\n",
+                        j + 1, it.score,
+                        it.x[0], it.y[0], it.x[1], it.y[1],
+                        it.x[2], it.y[2], it.x[3], it.y[3],
+                        it.text.c_str());
+        }
+        std::fflush(stdout);
+
+        if (json) {
+            if (!first_json) std::fprintf(json, ",\n");
+            first_json = false;
+            std::fprintf(json, "    {\"frame\": %lld, \"time\": %.6f, \"lines\": [", g.frame, g.time);
+            for (size_t j = 0; j < g.items.size(); ++j) {
+                const dedup::Item &it = g.items[j];
+                std::fprintf(json, "%s{\"text\": \"%s\", \"score\": %.6f, \"box\": [",
+                             j ? ", " : "", json_escape(it.text).c_str(), it.score);
+                for (int k = 0; k < 4; ++k)
+                    std::fprintf(json, "[%d, %d]%s", (int)std::lround(it.x[k]),
+                                 (int)std::lround(it.y[k]), k < 3 ? ", " : "");
+                std::fprintf(json, "]}");
+            }
+            std::fprintf(json, "]}");
+        }
+
+        if (!o.save_jpg_path.empty()) shots.emplace_back(g.frame, g.time);
+    };
+
+    // 同一帧的多个位置可能在不同轮次才结算(例如台词先被下一句打断、说话人名字稍后),
+    // 先攒一下再打印, 免得同一个帧号出现两次帧头。
+    std::vector<dedup::Group> pend;
+    auto flush_pend = [&]() {
+        for (const auto &g : pend) emit_group(g);
+        pend.clear();
+    };
+    auto push_group = [&](dedup::Group g) {
+        if (!pend.empty() && pend.front().frame != g.frame) flush_pend();
+        bool merged = false;
+        for (auto &x : pend) {
+            if (x.frame == g.frame) {
+                x.items.insert(x.items.end(), g.items.begin(), g.items.end());
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) pend.push_back(std::move(g));
+    };
 
     while (true) {
         size_t got = std::fread(frame.px.data(), 1, frame.px.size(), pipe);
@@ -425,6 +565,7 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
         std::vector<TextBox> kept;
         for (auto &it : items) {
             if (it.score < o.min_score) continue;
+            if (text_too_short(it.text, o.min_chars)) continue;
             if (!whole) {
                 for (int k = 0; k < 4; ++k) {
                     it.quad.p[k].x += (float)rx;
@@ -435,23 +576,32 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
         }
 
         ++sampled;
-        if (!kept.empty()) { ++frames_with_text; total_lines += (long long)kept.size(); }
 
-        // 只输出识别到文字的帧 (空帧仅计入汇总)
+        // 跨帧去重: 同一段文字只输出一次, 且跳过"字幕还没打印完整"的中间版本。
+        // 输出了哪些行、算在哪一帧, 全部由 LineDedup 决定(可能比当前帧滞后一两帧)。
         if (!kept.empty()) {
-            std::printf("[帧 %06lld] t=%s  %zu 行\n", frame_no, fmt_time(ts).c_str(),
-                        kept.size());
-            for (size_t j = 0; j < kept.size(); ++j) {
-                const Quad &q = kept[j].quad;
-                std::printf("    #%zu  %.3f  (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f)  %s\n",
-                            j + 1, kept[j].score,
-                            q.p[0].x, q.p[0].y, q.p[1].x, q.p[1].y,
-                            q.p[2].x, q.p[2].y, q.p[3].x, q.p[3].y,
-                            kept[j].text.c_str());
+            std::vector<dedup::Item> ditems;
+            ditems.reserve(kept.size());
+            for (const auto &it : kept) {
+                dedup::Item d;
+                d.text  = it.text;
+                d.score = it.score;
+                for (int k = 0; k < 4; ++k) { d.x[k] = it.quad.p[k].x; d.y[k] = it.quad.p[k].y; }
+                ditems.push_back(std::move(d));
             }
-            std::fflush(stdout);
+
+            if (o.dedup) {
+                for (auto &g : dedup_engine.feed(frame_no, ts, ditems)) push_group(std::move(g));
+            } else {
+                dedup::Group g;
+                g.frame = frame_no;
+                g.time  = ts;
+                g.items = std::move(ditems);
+                emit_group(g);
+            }
         }
 
+        // 可视化按原始采样帧保存, 不受去重影响(便于逐帧核对识别框)
         if (!o.visual_path.empty() && !kept.empty()) {
             Image vis = frame;
             for (size_t j = 0; j < kept.size(); ++j) {
@@ -468,24 +618,14 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
                 std::fprintf(stderr, "警告: 可视化帧写入失败: %s\n", fn);
         }
 
-        if (json) {
-            if (!first_json) std::fprintf(json, ",\n");
-            first_json = false;
-            std::fprintf(json, "    {\"frame\": %lld, \"time\": %.6f, \"lines\": [", frame_no, ts);
-            for (size_t j = 0; j < kept.size(); ++j) {
-                const Quad &q = kept[j].quad;
-                std::fprintf(json, "%s{\"text\": \"%s\", \"score\": %.6f, \"box\": [",
-                             j ? ", " : "", json_escape(kept[j].text).c_str(), kept[j].score);
-                for (int k = 0; k < 4; ++k)
-                    std::fprintf(json, "[%d, %d]%s", (int)std::lround(q.p[k].x),
-                                 (int)std::lround(q.p[k].y), k < 3 ? ", " : "");
-                std::fprintf(json, "]}");
-            }
-            std::fprintf(json, "]}");
-        }
-
         ++frame_no;
         if (o.max_frames > 0 && sampled >= o.max_frames) break;
+    }
+
+    // 视频结束: 把还在等待确认的段吐出来
+    if (o.dedup) {
+        for (auto &g : dedup_engine.flush()) push_group(std::move(g));
+        flush_pend();
     }
 
     int rc = PCLOSE_CMD(pipe);
@@ -505,15 +645,41 @@ static int run_video(const Options &o, const std::string &model_dir, const char 
         std::fclose(json);
     }
 
+    // --save-jpg: 把"去重后仍然有字幕"的那一帧从**原视频**整帧截出来。
+    // 必须重新调一次 ffmpeg —— 管道里只传了 ROI 那块像素, 拿不到整帧。
+    // 截图耗时不计入上面的识别耗时, 所以放在 elapsed 算完之后。
+    int saved = 0;
+    if (!o.save_jpg_path.empty()) {
+        make_dirs(o.save_jpg_path);
+        for (const auto &s : shots) {
+            const std::string out = o.save_jpg_path + "/" + jpg_name_of(s.second);
+            char ss[64];
+            std::snprintf(ss, sizeof(ss), "%.3f", s.second);
+            const std::string args = "-v error -nostdin -an -sn -ss " + std::string(ss)
+                                   + " -i " + quote_arg(o.video)
+                                   + " -frames:v 1 -q:v 2 -y " + quote_arg(out);
+            bool wrap = false;
+            run_capture(build_cmd(ffmpeg, args, wrap, true));
+            if (file_exists(out)) ++saved;
+            else std::fprintf(stderr, "警告: 截图失败: %s\n", out.c_str());
+        }
+    }
+
     std::printf("---------------------------------------------------------------\n");
     std::printf("抽样帧数  : %lld\n", sampled);
-    std::printf("含文字帧  : %lld\n", frames_with_text);
+    std::printf("输出帧数  : %lld\n", frames_with_text);
     std::printf("文字总行数: %lld\n", total_lines);
+    if (o.dedup)
+        std::printf("去重抑制  : %lld 行 (重复出现, 以及字幕未打印完整的中间版本)\n",
+                    dedup_engine.suppressed());
     std::printf("耗时      : %.1f s", elapsed);
     if (sampled > 0) std::printf("  (平均 %.1f ms/帧)", elapsed * 1000.0 / (double)sampled);
     std::printf("\n");
     if (!o.json_path.empty())   std::printf("JSON      : %s\n", o.json_path.c_str());
     if (!o.visual_path.empty()) std::printf("可视化目录: %s\n", o.visual_path.c_str());
+    if (!o.save_jpg_path.empty())
+        std::printf("截图目录  : %s  (%d/%zu 张)\n", o.save_jpg_path.c_str(),
+                    saved, shots.size());
     return 0;
 }
 
@@ -554,8 +720,12 @@ int main(int argc, char **argv) {
         else if (a == "--unclip")        o.unclip = (float)std::atof(next().c_str());
         else if (a == "--threads")       o.threads = std::atoi(next().c_str());
         else if (a == "--min-score")     o.min_score = (float)std::atof(next().c_str());
+        else if (a == "--min-chars")     o.min_chars = std::atoi(next().c_str());
+        else if (a == "--only-text")     o.only_text = true;
+        else if (a == "--dedup")         o.dedup = true;
         else if (a == "--json")          o.json_path = next();
         else if (a == "--visual")        o.visual_path = next();
+        else if (a == "--save-jpg")      o.save_jpg_path = next();
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
         else {
             std::fprintf(stderr, "未知参数: %s\n\n", a.c_str());
@@ -604,7 +774,7 @@ int main(int argc, char **argv) {
 
     // ---------- 视频模式: 可视化输出是目录, 不存在则建 ----------
     if (is_video && !o.visual_path.empty()) {
-        if (!file_exists(o.visual_path)) { MKDIR_ONE(o.visual_path.c_str()); }
+        make_dirs(o.visual_path);
     }
 
     try {

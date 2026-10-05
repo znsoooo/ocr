@@ -1,0 +1,463 @@
+================================================================================
+  OCR 文字识别工具  ——  Windows 使用说明
+  (纯本地离线 OCR：文字识别 + 文字位置，不联网、不上传图片)
+================================================================================
+
+【目录结构】
+
+  ocr/
+    ├─ 使用说明.txt              ← 你正在看的这个文件
+    ├─ windows/                  ← 开箱即用：解压就能跑
+    │    ├─ ocr.exe                  图片 / 视频识别（同一个 exe）
+    │    ├─ onnxruntime.dll          推理引擎（必须有，不能删）
+    │    ├─ models/                  模型（必须有，不能删）
+    │    │    ├─ det_v4.onnx  rec_v4.onnx  keys_v4.txt    PP-OCRv4（默认）
+    │    │    └─ det_v5.onnx  rec_v5.onnx  keys_v5.txt    PP-OCRv5（--v5 时用）
+    │    └─ samples/                 示例素材
+    │         ├─ sample_ui.png           模拟软件界面截图
+    │         ├─ game_dialogue.png       真实游戏截图
+    │         └─ test_video.mp4          测试视频（5 秒，底部字幕逐秒变化）
+    ├─ cpp/                    ← 完整源码
+    ├─ 第三方组件来源.md       ← 模型/推理引擎/ffmpeg 分别从哪里下载的
+    └─ onnxruntime-win-x64-1.30.0/   ← 编译 exe 所需的头文件与导入库
+
+  ★ 图片和视频用的是**同一个 ocr.exe**，区别只在于命令行写 --image 还是 --video。
+
+
+================================================================================
+ 一、最快上手（什么都不用装）
+================================================================================
+
+  1. 把整个压缩包解压到一个**没有中文和空格**的路径，例如 D:\ocr
+     （路径带中文一般也能用，但出问题时先排除这一项）
+
+  2. 按 Win+R，输入 cmd 回车，然后进到 windows 目录：
+
+        cd /d D:\ocr\windows
+
+  3. 识别一张图片：
+
+        ocr.exe --image samples\sample_ui.png
+
+     你会看到类似这样的输出（前面是坐标，用来定位文字在图片里的位置）：
+
+        # samples\sample_ui.png  760x460  检测到 15 行文字  耗时 176 ms (PP-OCRv4)
+        [01] x=  81 y=  14 w= 184 h= 28  score=0.96  PixPin设置·文字识别
+        [02] x=  28 y=  73 w= 184 h= 32  score=0.99  文字识别功能说明
+        ...
+
+  4. 识别一段视频（需要 ffmpeg，见第四节）：
+
+        ocr.exe --video samples\test_video.mp4 --every-seconds 0.5
+
+  提示：直接双击 exe 会打印用法说明，因为它需要命令行参数。
+       把图片文件直接拖到 ocr.exe 上也可以，但那样等于双击，仍然需要敲参数。
+
+
+================================================================================
+ 二、识别图片（--image）
+================================================================================
+
+  用法：
+      ocr.exe --image <图片路径> [选项]
+
+  选项：
+      --roi x,y,w,h         只识别图片的一部分。四个值全部 ≤1 时按相对比例解释，
+                            否则按像素（详见第三节 ★ 感兴趣区域）
+      --v5                  改用 PP-OCRv5 模型（对中英日韩混排更友好，
+                            但更容易把图标误判成文字）
+      --unclip 2.0          文本框外扩系数。默认 2.0；
+                            漏字就调大到 2.5，框太松就调到 1.5
+      --min-score 0.9       只看置信度 ≥ 0.9 的结果（默认 0，不过滤）
+      --visual out.png      把识别框画到图上另存，用来核对定位是否准
+      --json out.json       把「文字 + 置信度 + 四点坐标」写成 JSON
+      --threads 4           推理线程数，CPU 核多可以调大
+
+  例子：
+      ocr.exe --image D:\照片\截图.png
+      ocr.exe --image D:\照片\截图.png --visual D:\照片\标注.png
+      ocr.exe --image D:\照片\截图.png --json D:\照片\结果.json --v5
+
+  输出的每一行长这样：
+
+      [序号] x=.. y=.. w=.. h=..  score=置信度  识别出的文字
+
+  x,y 是文字左上角在图片里的像素坐标，w,h 是宽高。
+  需要精确的**四点坐标**（文字倾斜时不是矩形）就用 --json。
+
+
+================================================================================
+ 三、识别视频（--video）
+================================================================================
+
+  用法：
+      ocr.exe --video <视频路径> [选项]
+
+  ★ 抽帧间隔（二选一；都不指定就是**逐帧**）
+
+      --every-seconds 0.5   每 0.5 秒取 1 帧
+      --every-frames 25     每隔 25 帧取 1 帧
+
+    注意：--every-seconds 是按视频**真实时间戳(PTS)**选帧的，不是简单"每 N 帧"，
+          所以变帧率视频（手机录屏）也能对得准。
+
+  ★ 感兴趣区域（自动判断像素还是比例）
+
+      --roi x,y,w,h         四个值**全部 ≤ 1** 时按相对比例解释，否则按像素：
+
+                               --roi 0,0.75,1,0.25       画面底部 1/4（比例写法）
+                               --roi 100,570,800,140     指定像素位置
+
+                            不指定就是整个画面。
+                            --image 图片模式同样支持这个参数。
+
+  ★ 输出
+
+      --min-score 0.9       只看置信度 ≥ 0.9 的结果（默认 0，不过滤）
+      --json out.json       结果写 JSON（逐帧：时间点 + 帧号 + 文字 + 四点坐标）
+      --visual DIR          把识别到文字的采样帧画框后存到该目录
+                            （目录不存在会自动创建）
+      --max-frames N        只处理前 N 个采样帧（先试跑用）
+
+    说明：默认就只打印**识别到文字的帧**，空白帧只计入最后的汇总。
+
+  常用组合：
+
+      :: 逐帧识别全画面
+      ocr.exe --video 视频.mp4
+
+      :: 每 0.5 秒一帧，只看置信度 0.9 以上的
+      ocr.exe --video 视频.mp4 --every-seconds 0.5 --min-score 0.9
+
+      :: 只认底部字幕区（比例写法：画面底部 1/4）
+      ocr.exe --video 视频.mp4 --roi 0,0.75,1,0.25 --every-seconds 0.5
+
+      :: 只认底部字幕区（像素写法：x=100 y=570 起，宽 800 高 140）
+      ocr.exe --video 视频.mp4 --roi 100,570,800,140 --every-seconds 0.5
+
+      :: 先试跑 5 帧看看参数对不对，再跑全片
+      ocr.exe --video 视频.mp4 --max-frames 5
+
+  输出的每一帧长这样：
+
+      [帧 000020] t=00:01.033  3 行
+          #1  1.000  (66,20) (104,20) (104,41) (66,41)  自动
+          #2  0.983  (450,495) (524,495) (524,526) (450,526)  迪卢克
+          #3  0.987  (851,623) (948,623) (948,639) (851,639)  UID:249620679
+
+      [帧 000020]      ← 源视频的**原始帧号**（不是第几个采样帧）
+      t=00:01.033      ← 这一帧的真实时间点
+      (x1,y1)(x2,y2)(x3,y3)(x4,y4)  ← 四角坐标，用 ROI 时已换算回整帧坐标
+
+  ★ 性能提示
+
+      全屏识别 1080p 大约 100~200 毫秒/帧（4 线程），比实时慢数倍。
+      长视频强烈建议：
+        - 用 --roi 只框住文字区域（会快 2~3 倍，而且更准）
+        - 用 --every-seconds 抽帧，不要逐帧
+        - --threads 调到 CPU 核数
+
+
+================================================================================
+ 四、视频功能需要 ffmpeg（重要）
+================================================================================
+
+  ocr.exe 的 --video 模式通过调用 ffmpeg 来解码视频，所以需要 ffmpeg.exe。
+
+  程序会先在**自己所在的目录**里找，再去**系统 PATH** 里找；
+  两处都没有时会直接报错提示，不会静默失败。
+
+  检查有没有：
+      ffmpeg -version
+
+  如果没有，两种办法：
+
+  办法 A（推荐，不用装）：
+      去 https://www.gyan.dev/ffmpeg/builds/ 下载
+      "ffmpeg-release-essentials.zip"，解压后把 bin\ffmpeg.exe 和
+      bin\ffprobe.exe 两个文件，直接放到 windows\ 目录下（和 ocr.exe 放一起）。
+
+  办法 B：把 ffmpeg 的 bin 目录加入系统 PATH 环境变量。
+
+  注意：ffmpeg.exe 和 ffprobe.exe **两个都要**。
+        ffprobe 用来读取视频的帧率、分辨率和逐帧时间戳。
+
+  只做图片识别（--image）的话，不需要 ffmpeg。
+
+
+================================================================================
+ 五、常见问题
+================================================================================
+
+  Q: 报错 "Load model from ... failed: File doesn't exist"
+  A: 说明模型文件没找到。检查 windows\models\ 目录是否完整
+     （应该有 det_v4.onnx / rec_v4.onnx / keys_v4.txt 等 6 个文件）。
+     程序会自动在 exe 所在目录及其上级目录里找 models\；
+     如果你把 exe 单独拷走了，请把 models\ 一起带上（放在 exe 同目录或其上级）。
+
+  Q: 报错 "无法启动 ffmpeg" 或 "没有读到任何帧"
+  A: ffmpeg.exe / ffprobe.exe 不在 PATH 也不在 exe 同目录。见第四节。
+
+  Q: 提示缺少 MSVCP140.dll / VCRUNTIME140.dll，程序起不来
+  A: 装一次「Microsoft Visual C++ 2015-2022 可再发行组件 (x64)」即可：
+         https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+     为什么要装：ocr.exe 已经静态链接了运行库（只依赖 KERNEL32 / msvcrt），
+     但 onnxruntime.dll 是微软官方编译的二进制，实测它的导入表里依赖
+     MSVCP140.dll、MSVCP140_1.dll、VCRUNTIME140.dll、VCRUNTIME140_1.dll。
+     Win10/11 上绝大多数机器已经装过（很多软件会捎带安装），干净系统可能没有。
+
+  Q: Windows Defender 报毒 / 提示未知发布者
+  A: exe 没有做代码签名，属于正常提示。点"仍要运行"即可，
+     或把目录加入排除项。
+
+  Q: 识别漏字了怎么办
+  A: 依次尝试：
+     1) --unclip 2.5        把文本框扩得松一点
+     2) --v5                换更强的模型
+     3) 用 --roi 把区域框小一点，让文字在画面里占比更大
+     4) 图片太小的话先放大 2 倍再识别（小字是 OCR 的固有难点）
+
+  Q: 我不想让它识别出图标、把它当成文字了
+  A: 提高阈值 --min-score 0.9（两种模式都支持）。
+     不加 --min-score 时也可以看 score 列，低分的行自己忽略。
+
+  Q: 输出里的中文在 cmd 里是乱码？
+  A: 先执行 chcp 65001 切换到 UTF-8 代码页即可。
+     或者直接把结果输出成 JSON（--json），用记事本打开就是正常的。
+
+  Q: 识别的坐标是相对什么的？
+  A: 都是相对**整张图片 / 整帧画面**的左上角。
+     即使你用了 --roi，输出时也已经把偏移换算回去了，
+     所以可以直接拿来在原图上画标注框。
+
+
+================================================================================
+ 六、想自己编译（cpp 目录）
+================================================================================
+
+  需要：MinGW-w64 工具链（g++ / mingw32-make）+ CMake
+
+  两个最简单的获取方式：
+    A. w64devkit（免安装）
+       https://github.com/skeeto/w64devkit/releases
+       解压后运行里面的 w64devkit.exe，在它打开的终端里执行下面的命令。
+       这个终端里 g++ / make / cmake 都自带，不用再装别的。
+
+    B. MSYS2
+       https://www.msys2.org/
+       安装后打开 "MSYS2 UCRT64" 终端，执行：
+           pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake
+       然后在该终端里执行下面的命令。
+
+  ONNX Runtime 的头文件和导入库**已经随包附带**（根目录的
+  onnxruntime-win-x64-1.30.0 文件夹），不需要再下载任何东西。
+
+  一键编译：
+      cd cpp
+      build_windows.bat
+
+  或者手动来：
+      cd cpp
+      cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_CXX_COMPILER=g++ ^
+            -DONNXRUNTIME_ROOT=..\onnxruntime-win-x64-1.30.0 -DCMAKE_BUILD_TYPE=Release
+      cmake --build build -j
+
+  产物：cpp\build\ocr.exe
+        （CMake 会自动把 onnxruntime.dll 拷到 exe 旁边）
+        这个 exe 已静态链接 gcc/stdc++，不依赖任何 MinGW 的 DLL。
+
+  试用：
+      cd cpp
+      build\ocr.exe --image ..\samples\sample_ui.png
+      build\ocr.exe --video ..\samples\test_video.mp4 --every-seconds 0.5
+
+  模型会自动向上找到（在仓库根目录 models\），素材在 samples\。
+
+  源码文件说明：
+     cpp\ocr_engine.h       公共 OCR 引擎（检测 + 识别 + CTC + 排版）
+     cpp\video_io.h         视频探测 / 逐帧解码（ffmpeg 管道）
+     cpp\main.cpp           ocr 的唯一入口：--image / --video 两种模式
+     cpp\CMakeLists.txt     构建脚本
+     cpp\build_windows.bat  一键编译
+
+  完整技术文档见 README.md（用法、踩坑记录、已知限制）；
+  调研与实现记录见 PixPin技术路线.md。
+
+
+================================================================================
+ 七、这个包是什么
+================================================================================
+
+  实现的是截图类工具常用的「本地离线文字识别」完整链路：
+
+      文本检测 (DBNet)  →  得到每行文字的四点坐标
+      文本识别 (CRNN+CTC) →  读出框里的字符串
+      后处理            →  按行分组，还原阅读顺序
+
+  模型用的是 PP-OCRv4 / PP-OCRv5 的官方 ONNX 模型（PaddleOCR，Apache-2.0），
+  推理用 ONNX Runtime，全程本地，不联网、不上传任何图片。
+
+  当前的局限：没有方向分类模型（倒置文字读不出）、没有超分预处理
+  （极小字号弱一些）、没有段落级版面分析。详见 README.md 第 3 节。
+
+
+================================================================================
+ 附录 A：最小运行集合（哪些文件是必须的）
+================================================================================
+
+  【A-1】只做图片识别 —— 最小集合 ≈ 33 MB
+
+      windows\ocr.exe             2.61 MB   ← 本项目的代码
+      windows\onnxruntime.dll    15.70 MB   ← 推理引擎（微软官方预编译）
+      models\det_v4.onnx          4.53 MB   ← 检测模型
+      models\rec_v4.onnx         10.35 MB   ← 识别模型
+      models\keys_v4.txt          0.03 MB   ← 字典
+      ─────────────────────────────────────
+      合计                        ≈ 33 MB
+
+      再加一个你要识别的图片路径即可运行。
+      注意：models\ 下的 v5 三个文件（共 20.5 MB）只有加 --v5 时才需要，
+            不带也可以删掉，不影响默认使用。
+
+  【A-2】要识别视频 —— 在 A-1 基础上追加
+
+      windows\ffmpeg.exe        ≈ 80~160 MB  ← 从网上下载（见第四节）
+      windows\ffprobe.exe       ≈ 80~160 MB  ← 同上
+
+      注意：程序本身还是那一个 ocr.exe，视频功能不需要额外的 exe。
+
+  【A-3】这些是 Windows 系统自带的，不用你管
+
+      KERNEL32.dll / msvcrt.dll        （系统必有）
+      MSVCP140.dll / VCRUNTIME140.dll  （微软 C++ 运行库，绝大多数机器已有，
+                                        缺了就装一次 vc_redist，见第五节）
+
+  【A-4】明确不需要的东西
+
+      × Python / pip / 任何 Python 包
+      × OpenCV
+      × PaddlePaddle / PaddleOCR
+      × Visual Studio（用 MinGW-w64 编译）
+      × 显卡驱动、CUDA（只用 CPU）
+      × 联网（全程离线）
+
+  【A-5】"被测文件"说明
+
+      你提到的"被测文件"（图片/视频）是**数据**，不是程序的一部分。
+      它放哪儿都行，运行时把路径传给 exe 即可，可以是绝对路径：
+          ocr.exe --image D:\我的图片\截图.png
+
+
+================================================================================
+ 附录 B：编译 exe 需要什么（源码依赖关系）
+================================================================================
+
+  编译 ocr.exe 需要两部分：
+
+  【B-1】本项目自己的源码（在 cpp\ 下）
+
+      cpp\main.cpp              ocr 的主程序（图片/视频两种模式的入口）
+      cpp\ocr_engine.h          公共 OCR 引擎（检测+识别+CTC+排版）
+      cpp\video_io.h            视频探测与逐帧解码（ffmpeg 管道）
+      cpp\CMakeLists.txt        构建脚本
+      cpp\stb_image.h           单头文件图像解码（第三方，公开领域）
+      cpp\stb_image_write.h     单头文件图像编码（第三方，公开领域）
+      cpp\build_windows.bat     一键编译（可选，方便用）
+
+  【B-2】ONNX Runtime 的开发包（不在 cpp\ 下，容易被漏掉！）
+
+      onnxruntime-win-x64-1.30.0\include\   19 个头文件（1.2 MB）
+      onnxruntime-win-x64-1.30.0\lib\onnxruntime.lib   导入库（2 KB）
+
+      这个目录随包附带了，不用另外下载。
+      编译时链接的是 onnxruntime.lib，生成的 exe 运行时要的是 onnxruntime.dll
+      （在 windows\ 下）——两个是配对的一份东西：.lib 管编译，.dll 管运行。
+
+  【B-3】还需要安装的软件（不是文件）
+
+      MinGW-w64 工具链（g++ 和 mingw32-make），以及 CMake
+      推荐 w64devkit（免安装）或 MSYS2，见第六节
+
+  换个说法：**exe 是"cpp\ 下的 3 个源文件 + 2 个 stb 头文件 + ONNX Runtime 头文件
+  和导入库"用 MinGW-w64 编译出来的**，除此之外没有别的隐藏依赖。
+
+
+================================================================================
+ 附录 C：每个文件的来源（哪些是下载的，哪些是本项目生成的）
+================================================================================
+
+  文件                                来源
+  ─────────────────────────────────────────────────────────────────────────
+  cpp\ocr_engine.h                    本项目编写
+  cpp\main.cpp                        本项目编写
+  cpp\video_io.h                      本项目编写
+  cpp\CMakeLists.txt                  本项目编写
+  cpp\build_windows.bat               本项目编写
+  README.md / 本文档                  本项目编写
+  PixPin技术路线.md                   调研与实现记录（归档快照，不再更新）
+
+  windows\ocr.exe                     本项目源码编译（MinGW-w64 静态链接）
+
+  windows\onnxruntime.dll             ← 下载。微软官方 GitHub Release 的
+                                        onnxruntime-win-x64-1.30.0.zip 里的
+                                        lib\onnxruntime.dll（16,462,648 字节）
+  onnxruntime-win-x64-1.30.0\*        ← 下载。同一个 zip 里的 include\ 和
+                                        onnxruntime.lib
+
+  models\*.onnx                       ← 下载。从 ModelScope 上
+                                        RapidAI/RapidOCR 仓库获取，它们是
+                                        PaddleOCR 官方模型转换成的 ONNX 格式
+                                        （Apache-2.0 许可）
+  models\keys_*.txt                   ← 下载。同上仓库，是识别模型的字符字典
+
+  cpp\stb_image.h                     ← 下载。github.com/nothings/stb
+  cpp\stb_image_write.h               ← 下载。同上
+
+  windows\ffmpeg.exe                  ← 下载。gyan.dev / BtbN 的 Windows 静态构建
+  windows\ffprobe.exe                 ← 下载。同一个压缩包里的两个 exe
+                                        （静态构建，除了系统 DLL 不需要任何其他 dll）
+
+  samples\*                           ← 素材。sample_ui.png 由脚本生成，
+                                        game_dialogue.png 为实际截图，
+                                        test_video.mp4 由脚本生成
+
+  ★ 每个文件的**具体下载网址**、版本、许可证、校验哈希，
+    见同目录的《第三方组件来源.md》。
+
+
+================================================================================
+ 附录 D：onnxruntime.dll 将来需要变吗？
+================================================================================
+
+  【它是下载的，不是本项目编译的】
+      来源：https://github.com/microsoft/onnxruntime/releases
+            文件：onnxruntime-win-x64-1.30.0.zip → lib\onnxruntime.dll
+
+  【平时不需要动它】
+      · 它和模型文件是**互相独立**的：模型是 ONNX 格式的标准文件，任何较新版本
+        的 onnxruntime.dll 都能加载，不存在"必须配套"的版本绑定。
+      · 只要你不升级它，它就一直是好的，不会自己坏掉。
+
+  【唯一必须注意的一条规则】
+      如果你要换 onnxruntime.dll 的版本，**必须同时换成同一版本的头文件重新编译 exe**。
+      因为 ONNX Runtime 的 C++ 接口在运行时校验 API 版本号，头文件和 DLL 版本
+      不一致会直接抛错。也就是说：换 dll → 重新编译，两步一起做。
+
+  【什么情况下值得升级】
+      · 性能优化（新版通常更快一些）
+      · 安全修复
+      · 想用 GPU 加速：换 onnxruntime-win-x64-gpu-* 版本 + DirectML/CUDA 执行提供者
+      · 体积敏感：新版 DLL 体积略有变化
+
+  【什么情况下不需要升级】
+      只是识别中英文文字、只用 CPU —— 当前 1.30.0 完全够用，没必要折腾。
+
+  【如果哪天要升级，步骤】
+      1. 下载新版 onnxruntime-win-x64-<ver>.zip
+      2. 用新的 include\ 覆盖 onnxruntime-win-x64-1.30.0\include\
+      3. 用新的 lib\onnxruntime.lib 覆盖
+      4. 重新执行 cpp\build_windows.bat
+      5. 把新的 lib\onnxruntime.dll 复制到 windows\ 覆盖旧的
+      6. 跑一下 samples\sample_ui.png 确认结果正常
+================================================================================

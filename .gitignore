@@ -1,0 +1,30 @@
+# ---------- 构建产物（可由 cpp/build_windows.bat 或 CMake 重新生成）----------
+cpp/build/
+build/
+dist/
+
+# ---------- 便携版用的 ffmpeg（合计 320MB，需用户自行下载）----------
+# 注意: windows/ 下的 ocr.exe / onnxruntime.dll / samples/
+#       属于随包交付的可运行版本，已纳入版本管理，不在此忽略。
+windows/ffmpeg.exe
+windows/ffprobe.exe
+
+# ---------- 打包产物 ----------
+*.zip
+
+# ---------- 运行时输出 ----------
+out.*
+out_test.*
+*.part
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
